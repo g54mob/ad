@@ -1,0 +1,932 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Settings Vault</title>
+<style>
+  :root {
+    --bg-primary: #0d1117;
+    --bg-secondary: #161b22;
+    --bg-tertiary: #1c2128;
+    --bg-tile: #1c2128;
+    --bg-code: #0d1117;
+    --border-default: #30363d;
+    --border-green: #3fb950;
+    --border-red: #f85149;
+    --text-primary: #e6edf3;
+    --text-secondary: #8b949e;
+    --text-muted: #484f58;
+    --accent-blue: #58a6ff;
+    --accent-green: #3fb950;
+    --accent-red: #f85149;
+    --accent-orange: #d29922;
+    --accent-purple: #bc8cff;
+    --glow-green: rgba(63, 185, 80, 0.2);
+    --glow-red: rgba(248, 81, 73, 0.2);
+    --radius: 8px;
+    --radius-lg: 12px;
+    --mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'SF Mono', 'Consolas', monospace;
+    --transition: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: var(--mono);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    min-height: 100vh;
+    line-height: 1.6;
+    overflow-x: hidden;
+  }
+
+  /* Lock Screen */
+  #lockScreen {
+    position: fixed;
+    inset: 0;
+    background: var(--bg-primary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 9999;
+    transition: opacity 0.4s ease, transform 0.4s ease;
+  }
+  #lockScreen.unlocking {
+    opacity: 0;
+    transform: scale(1.02);
+    pointer-events: none;
+  }
+  #lockScreen.hidden { display: none; }
+
+  .lock-box {
+    text-align: center;
+    padding: 3rem 2.5rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-lg);
+    width: min(420px, 90vw);
+    animation: fadeUp 0.5s ease;
+  }
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .lock-icon {
+    font-size: 2.5rem;
+    margin-bottom: 1rem;
+    opacity: 0.8;
+  }
+  .lock-box h2 {
+    font-size: 1.1rem;
+    font-weight: 600;
+    margin-bottom: 0.4rem;
+    color: var(--text-primary);
+  }
+  .lock-box p {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    margin-bottom: 1.5rem;
+  }
+  .lock-input-wrap {
+    position: relative;
+    margin-bottom: 1rem;
+  }
+  .lock-input-wrap input {
+    width: 100%;
+    padding: 0.75rem 1rem;
+    padding-right: 2.5rem;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius);
+    color: var(--text-primary);
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    outline: none;
+    transition: border-color var(--transition);
+  }
+  .lock-input-wrap input:focus { border-color: var(--accent-blue); }
+  .lock-input-wrap .toggle-vis {
+    position: absolute;
+    right: 0.7rem;
+    top: 50%;
+    transform: translateY(-50%);
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 0.8rem;
+    font-family: var(--mono);
+  }
+  .lock-input-wrap .toggle-vis:hover { color: var(--text-secondary); }
+  .lock-actions {
+    display: flex;
+    gap: 0.6rem;
+  }
+  .lock-actions button {
+    flex: 1;
+    padding: 0.65rem;
+    border: none;
+    border-radius: var(--radius);
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all var(--transition);
+  }
+  .lock-actions button:hover { transform: translateY(-1px); }
+  .lock-actions button:active { transform: translateY(0); }
+  .btn-unlock { background: var(--accent-blue); color: #fff; }
+  .btn-new-vault { background: var(--bg-tertiary); color: var(--text-secondary); border: 1px solid var(--border-default) !important; }
+  .lock-error {
+    font-size: 0.72rem;
+    color: var(--accent-red);
+    margin-top: 0.6rem;
+    min-height: 1.2rem;
+  }
+  .lock-hint {
+    font-size: 0.68rem;
+    color: var(--text-muted);
+    margin-top: 1.2rem;
+  }
+
+  /* Main App */
+  #app { display: none; padding: 1.5rem; animation: fadeUp 0.4s ease; }
+  #app.visible { display: block; }
+
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 1.5rem;
+    padding-bottom: 1rem;
+    border-bottom: 1px solid var(--border-default);
+    flex-wrap: wrap;
+    gap: 1rem;
+  }
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: 0.8rem;
+  }
+  .header-left h1 {
+    font-size: 1.1rem;
+    font-weight: 700;
+    letter-spacing: -0.3px;
+  }
+  .badge {
+    font-size: 0.65rem;
+    padding: 0.2rem 0.5rem;
+    border-radius: 20px;
+    background: rgba(88, 166, 255, 0.15);
+    color: var(--accent-blue);
+    border: 1px solid rgba(88, 166, 255, 0.3);
+  }
+  .header-right {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+
+  button {
+    font-family: var(--mono);
+    cursor: pointer;
+    transition: all var(--transition);
+  }
+  .btn {
+    padding: 0.5rem 0.9rem;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius);
+    font-size: 0.72rem;
+    font-weight: 600;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+  }
+  .btn:hover { border-color: var(--text-muted); color: var(--text-primary); transform: translateY(-1px); }
+  .btn:active { transform: translateY(0); }
+  .btn-primary { background: var(--accent-blue); color: #fff; border-color: var(--accent-blue); }
+  .btn-primary:hover { background: #79b8ff; border-color: #79b8ff; }
+  .btn-danger { color: var(--accent-red); }
+  .btn-danger:hover { background: rgba(248, 81, 73, 0.1); border-color: var(--accent-red); }
+
+  /* Stats Bar */
+  .stats {
+    display: flex;
+    gap: 1.5rem;
+    margin-bottom: 1.5rem;
+    flex-wrap: wrap;
+  }
+  .stat {
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+  }
+  .stat span { color: var(--text-primary); font-weight: 600; }
+  .stat .green { color: var(--accent-green); }
+  .stat .red { color: var(--accent-red); }
+
+  /* Grid */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 400px), 1fr));
+    gap: 1.2rem;
+  }
+
+  /* Tile */
+  .tile {
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-lg);
+    background: var(--bg-tile);
+    transition: all var(--transition);
+    overflow: hidden;
+  }
+  .tile:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(0,0,0,0.3); }
+  .tile.available { border-color: var(--border-green); box-shadow: 0 0 20px var(--glow-green); }
+  .tile.exceeded { border-color: var(--border-red); box-shadow: 0 0 20px var(--glow-red); }
+  .tile.exceeded .tile-content { opacity: 0.5; }
+
+  .tile-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.9rem 1rem;
+    border-bottom: 1px solid var(--border-default);
+    gap: 0.5rem;
+  }
+  .tile-label {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    min-width: 0;
+  }
+  .tile-label span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .status-indicator {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    animation: pulse 2s ease-in-out infinite;
+  }
+  .status-indicator.green { background: var(--accent-green); box-shadow: 0 0 8px var(--accent-green); }
+  .status-indicator.red { background: var(--accent-red); box-shadow: 0 0 8px var(--accent-red); animation: none; }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+
+  .tile-actions {
+    display: flex;
+    gap: 0.3rem;
+    flex-shrink: 0;
+  }
+  .tile-btn {
+    padding: 0.3rem 0.55rem;
+    border: 1px solid var(--border-default);
+    border-radius: 6px;
+    font-size: 0.65rem;
+    font-weight: 600;
+    background: var(--bg-primary);
+    color: var(--text-secondary);
+    font-family: var(--mono);
+  }
+  .tile-btn:hover { border-color: var(--text-muted); color: var(--text-primary); }
+  .tile-btn.copy-btn { color: var(--accent-blue); border-color: rgba(88,166,255,0.3); }
+  .tile-btn.copy-btn:hover { background: rgba(88,166,255,0.1); }
+  .tile-btn.copy-btn.copied { color: var(--accent-green); border-color: var(--accent-green); background: rgba(63,185,80,0.1); }
+  .tile-btn.toggle-btn.is-available { color: var(--accent-green); border-color: rgba(63,185,80,0.3); }
+  .tile-btn.toggle-btn.is-exceeded { color: var(--accent-red); border-color: rgba(248,81,73,0.3); }
+  .tile-btn.del-btn:hover { color: var(--accent-red); border-color: var(--accent-red); background: rgba(248,81,73,0.1); }
+
+  .tile-content {
+    padding: 0.8rem 1rem;
+    max-height: 280px;
+    overflow: auto;
+    transition: opacity var(--transition);
+  }
+  .tile-content pre {
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    line-height: 1.55;
+    color: var(--text-secondary);
+    white-space: pre;
+    margin: 0;
+  }
+  .tile-content .key { color: var(--accent-purple); }
+  .tile-content .string { color: var(--accent-green); }
+  .tile-content .bool { color: var(--accent-orange); }
+  .tile-content .bracket { color: var(--text-muted); }
+
+  .tile-footer {
+    padding: 0.5rem 1rem;
+    border-top: 1px solid var(--border-default);
+    font-size: 0.62rem;
+    color: var(--text-muted);
+    display: flex;
+    justify-content: space-between;
+  }
+
+  /* Empty */
+  .empty-state {
+    text-align: center;
+    padding: 4rem 2rem;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+  }
+  .empty-state .icon { font-size: 2rem; margin-bottom: 1rem; opacity: 0.5; }
+  .empty-state p { margin-bottom: 0.5rem; }
+  .empty-state .hint { font-size: 0.7rem; }
+
+  /* Modal */
+  .modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.75);
+    backdrop-filter: blur(4px);
+    z-index: 1000;
+    justify-content: center;
+    align-items: center;
+    padding: 1rem;
+  }
+  .modal-overlay.active { display: flex; }
+  .modal {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-lg);
+    padding: 1.5rem;
+    width: min(560px, 100%);
+    max-height: 85vh;
+    overflow-y: auto;
+    animation: fadeUp 0.3s ease;
+  }
+  .modal h2 {
+    font-size: 0.95rem;
+    font-weight: 700;
+    margin-bottom: 1.2rem;
+    color: var(--text-primary);
+  }
+  .form-group { margin-bottom: 1rem; }
+  .form-group label {
+    display: block;
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin-bottom: 0.35rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .form-group input, .form-group textarea {
+    width: 100%;
+    padding: 0.65rem 0.8rem;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius);
+    color: var(--text-primary);
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    outline: none;
+    transition: border-color var(--transition);
+  }
+  .form-group input:focus, .form-group textarea:focus { border-color: var(--accent-blue); }
+  .form-group textarea { min-height: 220px; resize: vertical; line-height: 1.5; }
+  .form-group .helper {
+    font-size: 0.62rem;
+    color: var(--text-muted);
+    margin-top: 0.3rem;
+  }
+  .modal-footer {
+    display: flex;
+    gap: 0.6rem;
+    justify-content: flex-end;
+    margin-top: 1.2rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--border-default);
+  }
+
+  /* Toast */
+  .toast {
+    position: fixed;
+    bottom: 2rem;
+    left: 50%;
+    transform: translateX(-50%) translateY(100px);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius);
+    padding: 0.7rem 1.2rem;
+    font-size: 0.75rem;
+    color: var(--text-primary);
+    z-index: 2000;
+    opacity: 0;
+    transition: all 0.3s ease;
+    pointer-events: none;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  .toast.success { border-color: var(--accent-green); }
+  .toast.error { border-color: var(--accent-red); }
+
+  /* Responsive */
+  @media (max-width: 600px) {
+    body { font-size: 14px; }
+    #app { padding: 1rem; }
+    .header { flex-direction: column; align-items: flex-start; }
+    .grid { grid-template-columns: 1fr; }
+    .tile-header { flex-direction: column; align-items: flex-start; gap: 0.6rem; }
+    .tile-actions { width: 100%; justify-content: flex-end; }
+    .lock-box { padding: 2rem 1.5rem; }
+    .stats { gap: 1rem; }
+  }
+  @media (min-width: 1200px) {
+    #app { padding: 2rem 3rem; }
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border-default); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+  /* Drag */
+  .tile.dragging { opacity: 0.5; transform: rotate(1deg); }
+  .tile.drag-over { border-color: var(--accent-blue) !important; box-shadow: 0 0 20px rgba(88,166,255,0.3) !important; }
+</style>
+</head>
+<body>
+
+<!-- Lock Screen -->
+<div id="lockScreen">
+  <div class="lock-box">
+    <div class="lock-icon">&#128274;</div>
+    <h2>Settings Vault</h2>
+    <p>Your configs are encrypted with AES-256-GCM.</p>
+    <div class="lock-input-wrap">
+      <input type="password" id="passphrase" placeholder="Enter passphrase..." autocomplete="off" />
+      <button class="toggle-vis" onclick="togglePassVis()" tabindex="-1">show</button>
+    </div>
+    <div class="lock-actions">
+      <button class="btn-new-vault" onclick="createVault()">New Vault</button>
+      <button class="btn-unlock" onclick="unlock()">Unlock</button>
+    </div>
+    <div class="lock-error" id="lockError"></div>
+    <div class="lock-hint" id="lockHint"></div>
+  </div>
+</div>
+
+<!-- Main App -->
+<div id="app">
+  <div class="header">
+    <div class="header-left">
+      <h1>Settings Vault</h1>
+      <span class="badge">AES-256-GCM</span>
+    </div>
+    <div class="header-right">
+      <button class="btn btn-primary" onclick="openModal()">+ Add</button>
+      <button class="btn" onclick="resetAll()">All Available</button>
+      <button class="btn" onclick="exportVault()">Export</button>
+      <button class="btn" onclick="importVault()">Import</button>
+      <button class="btn btn-danger" onclick="lockVault()">Lock</button>
+    </div>
+  </div>
+
+  <div class="stats" id="stats"></div>
+  <div class="grid" id="grid"></div>
+  <div class="empty-state" id="empty" style="display:none">
+    <div class="icon">&#128451;</div>
+    <p>No configs stored yet.</p>
+    <p class="hint">Click "+ Add" to save your first settings.json</p>
+  </div>
+</div>
+
+<!-- Modal -->
+<div class="modal-overlay" id="modalOverlay" onclick="closeModal(event)">
+  <div class="modal" onclick="event.stopPropagation()">
+    <h2 id="modalTitle">Add Config</h2>
+    <div class="form-group">
+      <label>Label</label>
+      <input type="text" id="configName" placeholder="e.g. Bedrock Nexus Int" />
+      <div class="helper">Short name to identify this config</div>
+    </div>
+    <div class="form-group">
+      <label>settings.json</label>
+      <textarea id="configJson" placeholder='{"env": {...}, "model": "opus", ...}'></textarea>
+      <div class="helper">Paste your full settings.json content</div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveConfig()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script>
+const STORAGE_KEY = 'settings_vault_encrypted';
+const SALT_KEY = 'settings_vault_salt';
+const VERIFY_KEY = 'settings_vault_verify';
+
+let configs = [];
+let editingIndex = -1;
+let cryptoKey = null;
+let currentSalt = null;
+
+// --- Crypto ---
+async function deriveKey(passphrase, salt) {
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(passphrase), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: 310000, hash: 'SHA-256' },
+    keyMaterial,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+async function encrypt(data, key) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const enc = new TextEncoder();
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode(JSON.stringify(data)));
+  const buf = new Uint8Array(iv.length + ciphertext.byteLength);
+  buf.set(iv);
+  buf.set(new Uint8Array(ciphertext), iv.length);
+  return btoa(String.fromCharCode(...buf));
+}
+
+async function decrypt(b64, key) {
+  const raw = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const iv = raw.slice(0, 12);
+  const ciphertext = raw.slice(12);
+  const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+  return JSON.parse(new TextDecoder().decode(decrypted));
+}
+
+async function encryptVerify(passphrase, key) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const enc = new TextEncoder();
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode('vault_ok_' + passphrase.length));
+  const buf = new Uint8Array(iv.length + ct.byteLength);
+  buf.set(iv);
+  buf.set(new Uint8Array(ct), iv.length);
+  return btoa(String.fromCharCode(...buf));
+}
+
+async function checkVerify(b64, key) {
+  try {
+    const raw = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    const iv = raw.slice(0, 12);
+    const ct = raw.slice(12);
+    const dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
+    const text = new TextDecoder().decode(dec);
+    return text.startsWith('vault_ok_');
+  } catch { return false; }
+}
+
+// --- Vault Operations ---
+async function saveVault() {
+  if (!cryptoKey) return;
+  const encrypted = await encrypt(configs, cryptoKey);
+  localStorage.setItem(STORAGE_KEY, encrypted);
+}
+
+async function loadVault() {
+  const data = localStorage.getItem(STORAGE_KEY);
+  if (!data) { configs = []; return; }
+  configs = await decrypt(data, cryptoKey);
+}
+
+function hasVault() {
+  return localStorage.getItem(SALT_KEY) !== null;
+}
+
+// --- Lock Screen ---
+function initLockScreen() {
+  const hint = document.getElementById('lockHint');
+  if (hasVault()) {
+    hint.textContent = 'Existing vault detected. Enter your passphrase to unlock.';
+    document.querySelector('.btn-new-vault').textContent = 'Reset Vault';
+  } else {
+    hint.textContent = 'No vault found. Create one with a passphrase.';
+    document.querySelector('.btn-unlock').style.display = 'none';
+  }
+  document.getElementById('passphrase').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { hasVault() ? unlock() : createVault(); }
+  });
+  document.getElementById('passphrase').focus();
+}
+
+async function createVault() {
+  const pass = document.getElementById('passphrase').value;
+  if (pass.length < 4) { showLockError('Passphrase must be at least 4 characters.'); return; }
+
+  if (hasVault()) {
+    if (!confirm('This will DESTROY the existing vault and all stored configs. Continue?')) return;
+  }
+
+  currentSalt = crypto.getRandomValues(new Uint8Array(16));
+  localStorage.setItem(SALT_KEY, btoa(String.fromCharCode(...currentSalt)));
+  cryptoKey = await deriveKey(pass, currentSalt);
+
+  const verify = await encryptVerify(pass, cryptoKey);
+  localStorage.setItem(VERIFY_KEY, verify);
+
+  configs = [];
+  await saveVault();
+  showApp();
+  toast('Vault created successfully', 'success');
+}
+
+async function unlock() {
+  const pass = document.getElementById('passphrase').value;
+  if (!pass) { showLockError('Enter your passphrase.'); return; }
+
+  const saltB64 = localStorage.getItem(SALT_KEY);
+  if (!saltB64) { showLockError('No vault found. Create a new one.'); return; }
+
+  currentSalt = Uint8Array.from(atob(saltB64), c => c.charCodeAt(0));
+  cryptoKey = await deriveKey(pass, currentSalt);
+
+  const verifyB64 = localStorage.getItem(VERIFY_KEY);
+  if (verifyB64) {
+    const valid = await checkVerify(verifyB64, cryptoKey);
+    if (!valid) { showLockError('Wrong passphrase.'); cryptoKey = null; return; }
+  }
+
+  try {
+    await loadVault();
+    showApp();
+    toast('Vault unlocked', 'success');
+  } catch {
+    showLockError('Wrong passphrase or corrupted vault.');
+    cryptoKey = null;
+  }
+}
+
+function lockVault() {
+  cryptoKey = null;
+  configs = [];
+  document.getElementById('app').classList.remove('visible');
+  const lock = document.getElementById('lockScreen');
+  lock.classList.remove('hidden', 'unlocking');
+  document.getElementById('passphrase').value = '';
+  document.getElementById('lockError').textContent = '';
+  document.querySelector('.btn-unlock').style.display = '';
+  document.getElementById('lockHint').textContent = 'Vault locked. Enter passphrase to unlock.';
+  document.getElementById('passphrase').focus();
+}
+
+function showApp() {
+  const lock = document.getElementById('lockScreen');
+  lock.classList.add('unlocking');
+  setTimeout(() => {
+    lock.classList.add('hidden');
+    document.getElementById('app').classList.add('visible');
+    render();
+  }, 400);
+}
+
+function showLockError(msg) {
+  const el = document.getElementById('lockError');
+  el.textContent = msg;
+  el.style.animation = 'none';
+  el.offsetHeight;
+  el.style.animation = 'fadeUp 0.3s ease';
+}
+
+function togglePassVis() {
+  const inp = document.getElementById('passphrase');
+  const btn = inp.nextElementSibling;
+  if (inp.type === 'password') { inp.type = 'text'; btn.textContent = 'hide'; }
+  else { inp.type = 'password'; btn.textContent = 'show'; }
+}
+
+// --- Render ---
+function render() {
+  const grid = document.getElementById('grid');
+  const empty = document.getElementById('empty');
+  const stats = document.getElementById('stats');
+
+  const available = configs.filter(c => !c.exceeded).length;
+  const exceeded = configs.filter(c => c.exceeded).length;
+  stats.innerHTML = `
+    <div class="stat">Total: <span>${configs.length}</span></div>
+    <div class="stat">Available: <span class="green">${available}</span></div>
+    <div class="stat">Exceeded: <span class="red">${exceeded}</span></div>
+  `;
+
+  if (configs.length === 0) {
+    grid.innerHTML = '';
+    empty.style.display = 'block';
+    return;
+  }
+
+  empty.style.display = 'none';
+  grid.innerHTML = configs.map((cfg, i) => {
+    const statusClass = cfg.exceeded ? 'exceeded' : 'available';
+    const dotClass = cfg.exceeded ? 'red' : 'green';
+    const toggleClass = cfg.exceeded ? 'is-exceeded' : 'is-available';
+    const toggleLabel = cfg.exceeded ? 'LMT' : 'OK';
+
+    let displayJson = cfg.json;
+    try { displayJson = JSON.stringify(JSON.parse(cfg.json), null, 2); } catch {}
+    const highlighted = syntaxHighlight(displayJson);
+
+    const added = cfg.added ? new Date(cfg.added).toLocaleDateString() : '—';
+
+    return `
+      <div class="tile ${statusClass}" draggable="true" ondragstart="dragStart(event,${i})" ondragover="dragOver(event)" ondragleave="dragLeave(event)" ondrop="drop(event,${i})">
+        <div class="tile-header">
+          <div class="tile-label">
+            <div class="status-indicator ${dotClass}"></div>
+            <span>${escapeHtml(cfg.name)}</span>
+          </div>
+          <div class="tile-actions">
+            <button class="tile-btn" onclick="editConfig(${i})">edit</button>
+            <button class="tile-btn toggle-btn ${toggleClass}" onclick="toggleStatus(${i})">${toggleLabel}</button>
+            <button class="tile-btn copy-btn" id="copy-${i}" onclick="copyConfig(${i})">copy</button>
+            <button class="tile-btn del-btn" onclick="deleteConfig(${i})">del</button>
+          </div>
+        </div>
+        <div class="tile-content"><pre>${highlighted}</pre></div>
+        <div class="tile-footer">
+          <span>Added: ${added}</span>
+          <span>#${i + 1}</span>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function syntaxHighlight(json) {
+  return escapeHtml(json).replace(
+    /("(?:\\.|[^"\\])*")\s*:/g,
+    '<span class="key">$1</span>:'
+  ).replace(
+    /:\s*("(?:\\.|[^"\\])*")/g,
+    ': <span class="string">$1</span>'
+  ).replace(
+    /:\s*(true|false|null|\d+)/g,
+    ': <span class="bool">$1</span>'
+  );
+}
+
+function escapeHtml(str) {
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// --- Actions ---
+async function copyConfig(index) {
+  const text = configs[index].json;
+  try {
+    await navigator.clipboard.writeText(text);
+    const btn = document.getElementById(`copy-${index}`);
+    btn.textContent = 'ok!';
+    btn.classList.add('copied');
+    toast('Copied to clipboard', 'success');
+    setTimeout(() => { btn.textContent = 'copy'; btn.classList.remove('copied'); }, 1500);
+  } catch {
+    toast('Copy failed — check permissions', 'error');
+  }
+}
+
+async function toggleStatus(index) {
+  configs[index].exceeded = !configs[index].exceeded;
+  await saveVault();
+  render();
+}
+
+async function deleteConfig(index) {
+  if (!confirm(`Delete "${configs[index].name}"?`)) return;
+  configs.splice(index, 1);
+  await saveVault();
+  render();
+  toast('Config deleted', 'success');
+}
+
+function openModal(index) {
+  editingIndex = index !== undefined ? index : -1;
+  document.getElementById('modalTitle').textContent = editingIndex >= 0 ? 'Edit Config' : 'Add Config';
+  document.getElementById('configName').value = editingIndex >= 0 ? configs[editingIndex].name : '';
+  document.getElementById('configJson').value = editingIndex >= 0 ? configs[editingIndex].json : '';
+  document.getElementById('modalOverlay').classList.add('active');
+  setTimeout(() => document.getElementById('configName').focus(), 100);
+}
+
+function editConfig(index) { openModal(index); }
+
+function closeModal(event) {
+  if (event && event.target !== document.getElementById('modalOverlay')) return;
+  document.getElementById('modalOverlay').classList.remove('active');
+  editingIndex = -1;
+}
+
+async function saveConfig() {
+  const name = document.getElementById('configName').value.trim();
+  const json = document.getElementById('configJson').value.trim();
+  if (!name) { toast('Label is required', 'error'); return; }
+  if (!json) { toast('JSON content is required', 'error'); return; }
+
+  if (editingIndex >= 0) {
+    configs[editingIndex].name = name;
+    configs[editingIndex].json = json;
+  } else {
+    configs.push({ name, json, exceeded: false, added: Date.now() });
+  }
+
+  await saveVault();
+  render();
+  document.getElementById('modalOverlay').classList.remove('active');
+  editingIndex = -1;
+  toast(editingIndex >= 0 ? 'Config updated' : 'Config saved', 'success');
+}
+
+async function resetAll() {
+  configs.forEach(c => c.exceeded = false);
+  await saveVault();
+  render();
+  toast('All configs marked available', 'success');
+}
+
+// --- Export/Import ---
+async function exportVault() {
+  const blob = new Blob([JSON.stringify(configs, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'settings-vault-export.json'; a.click();
+  URL.revokeObjectURL(url);
+  toast('Vault exported (decrypted JSON)', 'success');
+}
+
+async function importVault() {
+  const input = document.createElement('input');
+  input.type = 'file'; input.accept = '.json';
+  input.onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const imported = JSON.parse(text);
+      if (!Array.isArray(imported)) throw new Error('Invalid format');
+      configs = [...configs, ...imported.map(c => ({ name: c.name || 'Imported', json: c.json || JSON.stringify(c), exceeded: false, added: Date.now() }))];
+      await saveVault();
+      render();
+      toast(`Imported ${imported.length} config(s)`, 'success');
+    } catch (err) {
+      toast('Import failed: ' + err.message, 'error');
+    }
+  };
+  input.click();
+}
+
+// --- Drag & Drop Reorder ---
+let dragIndex = -1;
+function dragStart(e, i) { dragIndex = i; e.currentTarget.classList.add('dragging'); }
+function dragOver(e) { e.preventDefault(); e.currentTarget.classList.add('drag-over'); }
+function dragLeave(e) { e.currentTarget.classList.remove('drag-over'); }
+async function drop(e, targetIndex) {
+  e.preventDefault();
+  e.currentTarget.classList.remove('drag-over');
+  if (dragIndex === targetIndex || dragIndex < 0) return;
+  const [item] = configs.splice(dragIndex, 1);
+  configs.splice(targetIndex, 0, item);
+  dragIndex = -1;
+  await saveVault();
+  render();
+}
+document.addEventListener('dragend', () => {
+  document.querySelectorAll('.tile').forEach(t => t.classList.remove('dragging', 'drag-over'));
+  dragIndex = -1;
+});
+
+// --- Toast ---
+function toast(msg, type) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast ' + (type || '');
+  setTimeout(() => el.classList.add('show'), 10);
+  setTimeout(() => el.classList.remove('show'), 2500);
+}
+
+// --- Keyboard Shortcuts ---
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    const modal = document.getElementById('modalOverlay');
+    if (modal.classList.contains('active')) { closeModal(); }
+  }
+  if (e.ctrlKey && e.key === 'n' && document.getElementById('app').classList.contains('visible')) {
+    e.preventDefault();
+    openModal();
+  }
+});
+
+// --- Init ---
+initLockScreen();
+</script>
+</body>
+</html>
