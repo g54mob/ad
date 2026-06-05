@@ -1,0 +1,35 @@
+{
+  "name": "markdown-viewer-electron",
+  "version": "1.0.0",
+  "description": "Standalone desktop Markdown viewer with live file watching",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win"
+  },
+  "build": {
+    "appId": "com.mdview.electron",
+    "productName": "MarkdownView",
+    "win": {
+      "target": "nsis",
+      "icon": null
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html",
+      "renderer.js",
+      "node_modules/**/*"
+    ]
+  },
+  "dependencies": {
+    "chokidar": "^3.6.0",
+    "highlight.js": "^11.9.0",
+    "lz-string": "^1.5.0",
+    "marked": "^9.1.6"
+  },
+  "devDependencies": {
+    "electron": "^28.1.0",
+    "electron-builder": "^24.9.1"
+  }
+}
