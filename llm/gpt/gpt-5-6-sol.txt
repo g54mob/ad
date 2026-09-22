@@ -1,5 +1,5 @@
 <!-- ==== FILE: .env ==== -->
-NEXUS_API_KEY=caf205b2-246b-468d-ad00-0766e2033314
+NEXUS_API_KEY=
 AZURE_OPENAI_ENDPOINT=https://genai-nexus.api.corpinter.net/
 AZURE_OPENAI_API_VERSION=2024-10-21
 NEXUS_MODEL=gpt-5.6-sol
@@ -1321,5 +1321,5 @@ pygments>=2.0.0
 
 <!-- ==== FILE: __PACK_META__ ==== -->
 files:      6
-chars:      48377
-packed_at:  2026-sep-22 19:25:17
+chars:      48341
+packed_at:  2026-sep-22 19:26:48
