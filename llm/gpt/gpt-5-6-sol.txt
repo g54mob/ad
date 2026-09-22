@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Literal
@@ -672,6 +673,33 @@ def show_reply(text: str) -> None:
     console.print(Panel(Markdown(text), title="response", title_align="left", border_style="green", padding=(0, 1)))
 
 
+class Transcript:
+    def __init__(self) -> None:
+        self.parts: list[str] = []
+
+    def add(self, title: str, body: str) -> None:
+        body = (body or "").strip()
+        if body:
+            self.parts.append(f"{title}\n{body}")
+
+    def text(self) -> str:
+        return "\n\n".join(self.parts).strip()
+
+
+def copy_to_clipboard(text: str) -> None:
+    subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+        ],
+        input=text,
+        text=True,
+        check=True,
+    )
+
+
 class Agent:
     def __init__(self, model: str, effort: str, show_reasoning: bool = False):
         self.client = create_client()
@@ -679,6 +707,7 @@ class Agent:
         self.effort = effort
         self.show_reasoning = show_reasoning
         self.messages: list[dict] = [{"role": "system", "content": build_system_prompt()}]
+        self.transcript = Transcript()
 
     def complete(self, messages: list[dict]):
         return self.client.beta.chat.completions.parse(
@@ -702,22 +731,29 @@ class Agent:
             show_skill(skill.name)
         if skills:
             expanded += "\n\n" + render_skills(skills)
+        self.transcript.add("Request", user_text)
         self.messages.append({"role": "user", "content": expanded})
         while True:
             show_thinking()
             response = self.complete(self.messages)
             message = response.choices[0].message
             if message.refusal:
+                self.transcript.add("Response", message.refusal)
                 return message.refusal
             step = message.parsed
             if step is None:
-                return message.content or "Model returned no action."
+                reply = message.content or "Model returned no action."
+                self.transcript.add("Response", reply)
+                return reply
             thought = (step.thought or "").strip()
             if thought:
+                self.transcript.add("Thinking", thought)
                 show_thought(thought)
             self.messages.append({"role": "assistant", "content": step.model_dump_json()})
             if step.action == "done":
-                return step.reply or "Done."
+                reply = step.reply or "Done."
+                self.transcript.add("Response", reply)
+                return reply
             target = step.skill if step.action == "use_skill" else step.path
             show_tool(step.action, target)
             result = run_action(step)
@@ -743,7 +779,7 @@ class Agent:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Nexus high-effort file agent")
-    parser.add_argument("prompt", nargs="+", help="One-shot prompt. Exits when the reply is done.")
+    parser.add_argument("prompt", nargs="+", help="Opening prompt. After the reply you can continue, /copy, or exit.")
     parser.add_argument("--workspace", help="Root for relative paths. A directory in the prompt is also used.")
     parser.add_argument("--model", default=MODEL)
     parser.add_argument("--effort", default=REASONING_EFFORT, choices=["none", "low", "medium", "high", "xhigh"])
@@ -758,11 +794,29 @@ def main() -> None:
             set_workspace(named[0])
     show_banner(args.model, args.effort)
     agent = Agent(args.model, args.effort, args.show_reasoning)
-    try:
-        show_reply(agent.ask(" ".join(args.prompt)))
-    except Exception as exc:
-        err_console.print(f"[red]Error:[/red] {exc}")
-        raise SystemExit(1)
+    pending = " ".join(args.prompt)
+    console.print("[dim]After each reply: type another request, /copy, or exit.[/dim]")
+    while True:
+        if not pending:
+            pass
+        elif pending.lower() in {"exit", "quit"}:
+            return
+        elif pending.lower() == "/copy":
+            try:
+                copy_to_clipboard(agent.transcript.text())
+                console.print("[bold green]Copied the requests, thinking, and responses to the clipboard.[/bold green]")
+            except Exception as exc:
+                err_console.print(f"[red]Copy failed:[/red] {exc}")
+        else:
+            try:
+                show_reply(agent.ask(pending))
+            except Exception as exc:
+                err_console.print(f"[red]Error:[/red] {exc}")
+        try:
+            pending = console.input("\n[bold green]>[/bold green] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            return
 
 
 if __name__ == "__main__":
@@ -1321,5 +1375,5 @@ pygments>=2.0.0
 
 <!-- ==== FILE: __PACK_META__ ==== -->
 files:      6
-chars:      48341
-packed_at:  2026-sep-22 19:26:48
+chars:      50199
+packed_at:  2026-sep-22 19:39:06
