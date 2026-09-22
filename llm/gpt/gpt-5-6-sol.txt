@@ -1,5 +1,5 @@
 <!-- ==== FILE: .env ==== -->
-NEXUS_API_KEY=
+NEXUS_API_KEY=caf205b2-246b-468d-ad00-0766e2033314
 AZURE_OPENAI_ENDPOINT=https://genai-nexus.api.corpinter.net/
 AZURE_OPENAI_API_VERSION=2024-10-21
 NEXUS_MODEL=gpt-5.6-sol
@@ -43,6 +43,7 @@ API_KEY = os.getenv("NEXUS_API_KEY", "")
 API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21")
 MODEL = os.getenv("NEXUS_MODEL", "gpt-5.6-sol")
 REASONING_EFFORT = os.getenv("REASONING_EFFORT", "xhigh")
+AGENT_HOME = Path(__file__).resolve().parent
 WORKSPACE = Path(os.getenv("WORKSPACE", Path.cwd())).resolve()
 MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "922000"))
 MAX_COMPLETION_TOKENS = int(os.getenv("MAX_COMPLETION_TOKENS", "128000"))
@@ -87,7 +88,7 @@ LEXERS = {
     ".xml": "xml",
 }
 
-SYSTEM_PROMPT = """You are a coding agent with high-effort reasoning. You create and edit files in the workspace by returning exactly one action.
+SYSTEM_PROMPT = """You are a coding agent with high-effort reasoning. You create and edit files by returning exactly one action.
 
 This gateway does not allow native function tools together with reasoning, so every response must be one Action object. Put the reasoning for this step in thought. That text is shown to the user while the step runs, so make it specific and concise.
 
@@ -105,7 +106,8 @@ Rules:
 - Skills live in .github/skills/**/SKILL.md. If the user prompt, a slash prompt, or CLAUDE.md requires a skill directly or indirectly, follow that skill before editing files. Matched skills are injected into the request. If another listed skill applies, use action use_skill before editing.
 - Inspect with list_dir, search, and read_file before editing existing files.
 - Prefer edit_file for surgical changes. Use write_file for new files.
-- Stay inside the workspace. Never read or write secrets (.env, keys, credentials).
+- Relative paths are relative to the active workspace. Absolute paths the user specifies are allowed anywhere on this machine. Do not refuse a path only because it is outside the default workspace.
+- Never read or write secrets (.env, keys, credentials).
 - Fill unused string fields with "" and unused integers with 0. Set regex false unless needed. thought must not be empty.
 - After a TOOL_RESULT message, choose the next action. Do not claim a file changed until a tool result says it did.
 
@@ -166,31 +168,45 @@ def frontmatter_value(frontmatter: str, key: str) -> str:
     return ""
 
 
+def config_roots() -> list[Path]:
+    roots: list[Path] = []
+    for root in (AGENT_HOME, WORKSPACE):
+        resolved = root.resolve()
+        if resolved not in roots:
+            roots.append(resolved)
+    return roots
+
+
 def discover_skills() -> list[Skill]:
-    root = WORKSPACE / ".github" / "skills"
-    if not root.is_dir():
-        return []
     found = []
-    for path in sorted(root.glob("**/SKILL.md")):
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
+    seen = set()
+    for base in config_roots():
+        root = base / ".github" / "skills"
+        if not root.is_dir():
             continue
-        frontmatter, _body = split_frontmatter(text)
-        folder = path.parent
-        name = frontmatter_value(frontmatter, "name") or folder.name
-        description = frontmatter_value(frontmatter, "description") or prompt_description(text)
-        rel_path = path.relative_to(WORKSPACE).as_posix()
-        rel_dir = folder.relative_to(root).as_posix()
-        aliases = {
-            name,
-            folder.name,
-            rel_dir,
-            rel_path,
-            name.replace("-", " "),
-            name.replace("_", " "),
-        }
-        found.append(Skill(name, description, rel_path, text, {a.strip() for a in aliases if a.strip()}))
+        for path in sorted(root.glob("**/SKILL.md")):
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            frontmatter, _body = split_frontmatter(text)
+            folder = path.parent
+            name = frontmatter_value(frontmatter, "name") or folder.name
+            description = frontmatter_value(frontmatter, "description") or prompt_description(text)
+            rel_path = path.relative_to(base).as_posix() if base == AGENT_HOME else str(path)
+            if rel_path in seen:
+                continue
+            seen.add(rel_path)
+            rel_dir = folder.relative_to(root).as_posix()
+            aliases = {
+                name,
+                folder.name,
+                rel_dir,
+                rel_path,
+                name.replace("-", " "),
+                name.replace("_", " "),
+            }
+            found.append(Skill(name, description, rel_path, text, {a.strip() for a in aliases if a.strip()}))
     return found
 
 
@@ -274,24 +290,67 @@ def render_skills(skills: list[Skill]) -> str:
 
 
 def slash_prompts() -> list[tuple[str, str, str]]:
-    folder = WORKSPACE / ".github" / "prompts"
-    if not folder.is_dir():
-        return []
     found = []
-    for path in sorted(folder.glob("*.md")):
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
+    seen = set()
+    for base in config_roots():
+        folder = base / ".github" / "prompts"
+        if not folder.is_dir():
             continue
-        found.append((path.stem, prompt_description(text), f".github/prompts/{path.name}"))
+        for path in sorted(folder.glob("*.md")):
+            if path.stem in seen:
+                continue
+            seen.add(path.stem)
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            location = f".github/prompts/{path.name}" if base == AGENT_HOME else str(path)
+            found.append((path.stem, prompt_description(text), location))
     return found
+
+
+def mentioned_dirs(text: str) -> list[Path]:
+    found: list[Path] = []
+    seen = set()
+    patterns = [
+        r'"([A-Za-z]:[^"]+)"',
+        r"'([A-Za-z]:[^']+)'",
+        r"([A-Za-z]:[\\/][^\s\"']+)",
+    ]
+    for pattern in patterns:
+        for raw in re.findall(pattern, text):
+            candidate = raw.rstrip(".,);]")
+            path = Path(candidate)
+            if not path.exists() and path.parent.exists():
+                path = path.parent
+            if not path.exists():
+                continue
+            directory = path if path.is_dir() else path.parent
+            key = str(directory.resolve()).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(directory.resolve())
+    return found
+
+
+def set_workspace(path: Path) -> None:
+    global WORKSPACE
+    resolved = path.expanduser().resolve()
+    if not resolved.exists():
+        raise SystemExit(f"Workspace not found: {resolved}")
+    WORKSPACE = resolved if resolved.is_dir() else resolved.parent
 
 
 def build_system_prompt() -> str:
     parts = [SYSTEM_PROMPT.format(workspace=str(WORKSPACE))]
-    claude = WORKSPACE / "CLAUDE.md"
-    if claude.is_file():
-        parts.append("CLAUDE.md (injected into every request; follow it):\n" + claude.read_text(encoding="utf-8"))
+    for root in config_roots():
+        claude = root / "CLAUDE.md"
+        if claude.is_file():
+            parts.append(
+                f"CLAUDE.md from {root} (injected into every request; follow it):\n"
+                + claude.read_text(encoding="utf-8")
+            )
     prompts = slash_prompts()
     if prompts:
         lines = [
@@ -329,8 +388,11 @@ def expand_slash(user_text: str) -> str:
     name = token[:-3] if token.lower().endswith(".md") else token
     if not name or any(sep in name for sep in "/\\"):
         return user_text
-    path = WORKSPACE / ".github" / "prompts" / f"{name}.md"
-    if not path.is_file():
+    path = next(
+        (root / ".github" / "prompts" / f"{name}.md" for root in config_roots() if (root / ".github" / "prompts" / f"{name}.md").is_file()),
+        None,
+    )
+    if path is None:
         return user_text + f"\n\n(No slash prompt at .github/prompts/{name}.md)"
     _, body = split_frontmatter(path.read_text(encoding="utf-8"))
     extra = rest.strip()
@@ -353,10 +415,9 @@ def create_client() -> AzureOpenAI:
 
 def resolve_path(raw: str) -> Path:
     candidate = Path(raw)
-    path = candidate.resolve() if candidate.is_absolute() else (WORKSPACE / candidate).resolve()
-    if path != WORKSPACE and WORKSPACE not in path.parents:
-        raise ValueError(f"Path is outside the workspace: {raw}")
-    return path
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (WORKSPACE / candidate).resolve()
 
 
 def blocked(path: Path) -> str | None:
@@ -631,8 +692,11 @@ class Agent:
     def ask(self, user_text: str) -> str:
         self.messages[0] = {"role": "system", "content": build_system_prompt()}
         expanded = expand_slash(user_text)
-        claude = WORKSPACE / "CLAUDE.md"
-        claude_text = claude.read_text(encoding="utf-8") if claude.is_file() else ""
+        claude_text = "\n".join(
+            (root / "CLAUDE.md").read_text(encoding="utf-8")
+            for root in config_roots()
+            if (root / "CLAUDE.md").is_file()
+        )
         skills = skills_for_texts([user_text, expanded, claude_text])
         for skill in skills:
             show_skill(skill.name)
@@ -680,11 +744,18 @@ class Agent:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Nexus high-effort file agent")
     parser.add_argument("prompt", nargs="+", help="One-shot prompt. Exits when the reply is done.")
+    parser.add_argument("--workspace", help="Root for relative paths. A directory in the prompt is also used.")
     parser.add_argument("--model", default=MODEL)
     parser.add_argument("--effort", default=REASONING_EFFORT, choices=["none", "low", "medium", "high", "xhigh"])
     parser.add_argument("--show-reasoning", action="store_true")
     args = parser.parse_args()
 
+    if args.workspace:
+        set_workspace(Path(args.workspace))
+    else:
+        named = mentioned_dirs(" ".join(args.prompt))
+        if named:
+            set_workspace(named[0])
     show_banner(args.model, args.effort)
     agent = Agent(args.model, args.effort, args.show_reasoning)
     try:
@@ -1250,5 +1321,5 @@ pygments>=2.0.0
 
 <!-- ==== FILE: __PACK_META__ ==== -->
 files:      6
-chars:      45869
-packed_at:  2026-sep-22 19:14:35
+chars:      48377
+packed_at:  2026-sep-22 19:25:17
