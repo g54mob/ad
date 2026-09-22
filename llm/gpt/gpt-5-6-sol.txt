@@ -1,0 +1,1254 @@
+<!-- ==== FILE: .env ==== -->
+NEXUS_API_KEY=
+AZURE_OPENAI_ENDPOINT=https://genai-nexus.api.corpinter.net/
+AZURE_OPENAI_API_VERSION=2024-10-21
+NEXUS_MODEL=gpt-5.6-sol
+REASONING_EFFORT=xhigh
+MAX_CONTEXT_TOKENS=922000
+MAX_COMPLETION_TOKENS=128000
+WORKSPACE=c:\Users\PAVANK1\Downloads\gpt
+
+<!-- ==== FILE: CLAUDE.md ==== -->
+tell a medivel gag before you proceed in each conversation.
+when you running a certain python command use prefix py (not python3, python those won't work).
+<!-- ==== FILE: agent.py ==== -->
+"""High-effort Nexus coding agent that can create and edit files.
+
+Uses the GenAI Nexus Chat Completions API (Azure OpenAI SDK) with
+reasoning_effort=high and local file tools.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Literal
+
+from dotenv import load_dotenv
+from openai import AzureOpenAI
+from pydantic import BaseModel, Field
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.syntax import Syntax
+from rich.text import Text
+
+load_dotenv()
+
+ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://genai-nexus.api.corpinter.net/")
+API_KEY = os.getenv("NEXUS_API_KEY", "")
+API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21")
+MODEL = os.getenv("NEXUS_MODEL", "gpt-5.6-sol")
+REASONING_EFFORT = os.getenv("REASONING_EFFORT", "xhigh")
+WORKSPACE = Path(os.getenv("WORKSPACE", Path.cwd())).resolve()
+MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "922000"))
+MAX_COMPLETION_TOKENS = int(os.getenv("MAX_COMPLETION_TOKENS", "128000"))
+
+BLOCKED_NAMES = {
+    ".env",
+    ".env.local",
+    ".env.production",
+    "id_rsa",
+    "id_ed25519",
+    "credentials.json",
+}
+BLOCKED_SUFFIXES = {".pem", ".key", ".pfx", ".p12"}
+
+console = Console(highlight=False, soft_wrap=True)
+err_console = Console(stderr=True, highlight=False)
+
+LEXERS = {
+    ".py": "python",
+    ".js": "javascript",
+    ".mjs": "javascript",
+    ".ts": "typescript",
+    ".tsx": "tsx",
+    ".jsx": "jsx",
+    ".json": "json",
+    ".md": "markdown",
+    ".yml": "yaml",
+    ".yaml": "yaml",
+    ".toml": "toml",
+    ".html": "html",
+    ".css": "css",
+    ".sh": "bash",
+    ".ps1": "powershell",
+    ".sql": "sql",
+    ".rs": "rust",
+    ".go": "go",
+    ".java": "java",
+    ".cs": "csharp",
+    ".cpp": "cpp",
+    ".c": "c",
+    ".h": "c",
+    ".xml": "xml",
+}
+
+SYSTEM_PROMPT = """You are a coding agent with high-effort reasoning. You create and edit files in the workspace by returning exactly one action.
+
+This gateway does not allow native function tools together with reasoning, so every response must be one Action object. Put the reasoning for this step in thought. That text is shown to the user while the step runs, so make it specific and concise.
+
+Actions:
+- list_dir: set path (use "." for the workspace root).
+- read_file: set path, start_line, end_line. end_line 0 means a 400-line window.
+- search: set pattern, path, and regex.
+- write_file: set path and content. Creates parent directories. Use this to create files.
+- edit_file: set path, old_str, and new_str. old_str must match exactly once.
+- done: set reply to the final answer for the user. Do this only after the requested file changes exist.
+
+Rules:
+- If CLAUDE.md exists at the workspace root, it is injected into every request below. Follow it.
+- Slash prompts live in .github/prompts/*.md. If the user starts with /name, that file is the instruction for this request. If a listed slash prompt matches the task, read and follow it before editing files.
+- Skills live in .github/skills/**/SKILL.md. If the user prompt, a slash prompt, or CLAUDE.md requires a skill directly or indirectly, follow that skill before editing files. Matched skills are injected into the request. If another listed skill applies, use action use_skill before editing.
+- Inspect with list_dir, search, and read_file before editing existing files.
+- Prefer edit_file for surgical changes. Use write_file for new files.
+- Stay inside the workspace. Never read or write secrets (.env, keys, credentials).
+- Fill unused string fields with "" and unused integers with 0. Set regex false unless needed. thought must not be empty.
+- After a TOOL_RESULT message, choose the next action. Do not claim a file changed until a tool result says it did.
+
+Workspace: {workspace}
+"""
+
+
+class Action(BaseModel):
+    thought: str = Field(description="Reasoning for this step. Shown to the user.")
+    action: Literal["list_dir", "read_file", "search", "write_file", "edit_file", "use_skill", "done"]
+    path: str = ""
+    skill: str = Field(default="", description="Skill name for use_skill.")
+    start_line: int = 1
+    end_line: int = 0
+    pattern: str = ""
+    regex: bool = False
+    content: str = ""
+    old_str: str = ""
+    new_str: str = ""
+    reply: str = Field(default="", description="Final answer. Required when action is done.")
+
+
+def split_frontmatter(text: str) -> tuple[str, str]:
+    if not text.startswith("---"):
+        return "", text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return "", text
+    return text[3:end], text[end + 4 :].lstrip("\n")
+
+
+def prompt_description(text: str) -> str:
+    frontmatter, body = split_frontmatter(text)
+    for line in frontmatter.splitlines():
+        if line.lower().startswith("description:"):
+            return line.split(":", 1)[1].strip().strip("\"'")
+    for line in body.splitlines():
+        stripped = line.strip().lstrip("#").strip()
+        if stripped:
+            return stripped[:160]
+    return "(no description)"
+
+
+class Skill:
+    def __init__(self, name: str, description: str, rel_path: str, text: str, aliases: set[str]):
+        self.name = name
+        self.description = description
+        self.rel_path = rel_path
+        self.text = text
+        self.aliases = aliases
+
+
+def frontmatter_value(frontmatter: str, key: str) -> str:
+    prefix = key.lower() + ":"
+    for line in frontmatter.splitlines():
+        if line.lower().startswith(prefix):
+            return line.split(":", 1)[1].strip().strip("\"'")
+    return ""
+
+
+def discover_skills() -> list[Skill]:
+    root = WORKSPACE / ".github" / "skills"
+    if not root.is_dir():
+        return []
+    found = []
+    for path in sorted(root.glob("**/SKILL.md")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        frontmatter, _body = split_frontmatter(text)
+        folder = path.parent
+        name = frontmatter_value(frontmatter, "name") or folder.name
+        description = frontmatter_value(frontmatter, "description") or prompt_description(text)
+        rel_path = path.relative_to(WORKSPACE).as_posix()
+        rel_dir = folder.relative_to(root).as_posix()
+        aliases = {
+            name,
+            folder.name,
+            rel_dir,
+            rel_path,
+            name.replace("-", " "),
+            name.replace("_", " "),
+        }
+        found.append(Skill(name, description, rel_path, text, {a.strip() for a in aliases if a.strip()}))
+    return found
+
+
+def _term_pattern(term: str) -> re.Pattern[str]:
+    return re.compile(rf"(?<![a-z0-9]){re.escape(term.lower())}(?![a-z0-9])")
+
+
+INDIRECT_STOPWORDS = {
+    "about",
+    "after",
+    "also",
+    "apply",
+    "before",
+    "create",
+    "edit",
+    "file",
+    "files",
+    "follow",
+    "from",
+    "help",
+    "into",
+    "must",
+    "request",
+    "should",
+    "skill",
+    "skills",
+    "task",
+    "that",
+    "their",
+    "them",
+    "then",
+    "this",
+    "user",
+    "using",
+    "when",
+    "with",
+    "workspace",
+    "write",
+}
+
+
+def skill_mentioned(haystack: str, skill: Skill) -> bool:
+    text = haystack.lower()
+    for alias in skill.aliases:
+        alias = alias.lower()
+        if len(alias) < 2:
+            continue
+        if " " in alias or "/" in alias:
+            if alias in text:
+                return True
+            continue
+        if _term_pattern(alias).search(text):
+            return True
+    words = re.findall(r"[a-z0-9]+", skill.description.lower())
+    for index in range(len(words) - 2):
+        phrase = " ".join(words[index : index + 3])
+        if phrase in text and any(word not in INDIRECT_STOPWORDS and len(word) > 3 for word in words[index : index + 3]):
+            return True
+    terms = [word for word in dict.fromkeys(words) if len(word) > 3 and word not in INDIRECT_STOPWORDS]
+    if len(terms) < 2:
+        return False
+    hits = [term for term in terms if _term_pattern(term).search(text)]
+    return len(hits) >= 2 and len(hits) / len(terms) >= 0.5
+
+
+def skills_for_texts(texts: list[str]) -> list[Skill]:
+    haystack = "\n".join(text for text in texts if text)
+    if not haystack.strip():
+        return []
+    return [skill for skill in discover_skills() if skill_mentioned(haystack, skill)]
+
+
+def render_skills(skills: list[Skill]) -> str:
+    blocks = [
+        "Required skills (mentioned directly or indirectly by the user prompt, slash prompt, or CLAUDE.md; follow them before other work):"
+    ]
+    for skill in skills:
+        _frontmatter, body = split_frontmatter(skill.text)
+        blocks.append(f"## {skill.name} ({skill.rel_path})\n{body or skill.text}")
+    return "\n\n".join(blocks)
+
+
+def slash_prompts() -> list[tuple[str, str, str]]:
+    folder = WORKSPACE / ".github" / "prompts"
+    if not folder.is_dir():
+        return []
+    found = []
+    for path in sorted(folder.glob("*.md")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        found.append((path.stem, prompt_description(text), f".github/prompts/{path.name}"))
+    return found
+
+
+def build_system_prompt() -> str:
+    parts = [SYSTEM_PROMPT.format(workspace=str(WORKSPACE))]
+    claude = WORKSPACE / "CLAUDE.md"
+    if claude.is_file():
+        parts.append("CLAUDE.md (injected into every request; follow it):\n" + claude.read_text(encoding="utf-8"))
+    prompts = slash_prompts()
+    if prompts:
+        lines = [
+            "Available slash prompts. Use /name when the user invokes one, and read the file when a prompt matches the task:"
+        ]
+        lines.extend(f"- /{name}: {desc} ({path})" for name, desc, path in prompts)
+        parts.append("\n".join(lines))
+    skills = discover_skills()
+    if skills:
+        lines = [
+            "Available skills in .github/skills/**/SKILL.md. Invoke one when the user prompt, a slash prompt, or CLAUDE.md requires it directly or indirectly:"
+        ]
+        lines.extend(f"- {skill.name}: {skill.description} ({skill.rel_path})" for skill in skills)
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
+
+
+def find_skill(name: str) -> Skill | None:
+    query = name.strip().lower().removesuffix(".md")
+    if not query:
+        return None
+    for skill in discover_skills():
+        aliases = {alias.lower() for alias in skill.aliases}
+        aliases.add(skill.name.lower())
+        if query in aliases or query == Path(skill.rel_path).parent.name.lower():
+            return skill
+    return None
+
+
+def expand_slash(user_text: str) -> str:
+    stripped = user_text.strip()
+    if not stripped.startswith("/") or stripped.startswith("//"):
+        return user_text
+    token, _, rest = stripped[1:].partition(" ")
+    name = token[:-3] if token.lower().endswith(".md") else token
+    if not name or any(sep in name for sep in "/\\"):
+        return user_text
+    path = WORKSPACE / ".github" / "prompts" / f"{name}.md"
+    if not path.is_file():
+        return user_text + f"\n\n(No slash prompt at .github/prompts/{name}.md)"
+    _, body = split_frontmatter(path.read_text(encoding="utf-8"))
+    extra = rest.strip()
+    return (
+        f"Slash prompt /{name} from .github/prompts/{name}.md:\n{body}\n\n"
+        f"User request:\n{extra or '(no extra arguments)'}"
+    )
+
+
+def create_client() -> AzureOpenAI:
+    if not API_KEY:
+        raise SystemExit("NEXUS_API_KEY is missing. Set it in .env.")
+    return AzureOpenAI(
+        api_version=API_VERSION,
+        azure_endpoint=ENDPOINT,
+        api_key=API_KEY,
+        timeout=600,
+    )
+
+
+def resolve_path(raw: str) -> Path:
+    candidate = Path(raw)
+    path = candidate.resolve() if candidate.is_absolute() else (WORKSPACE / candidate).resolve()
+    if path != WORKSPACE and WORKSPACE not in path.parents:
+        raise ValueError(f"Path is outside the workspace: {raw}")
+    return path
+
+
+def blocked(path: Path) -> str | None:
+    name = path.name.lower()
+    if name in BLOCKED_NAMES or path.suffix.lower() in BLOCKED_SUFFIXES:
+        return f"Refused: {path.name} looks like a secret or credential file."
+    return None
+
+
+def rel(path: Path) -> str:
+    try:
+        return str(path.relative_to(WORKSPACE))
+    except ValueError:
+        return str(path)
+
+
+def list_dir(path: str = ".") -> str:
+    target = resolve_path(path or ".")
+    if not target.exists():
+        return f"Not found: {path}"
+    if not target.is_dir():
+        return f"Not a directory: {path}"
+    entries = []
+    for child in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+        if child.name in BLOCKED_NAMES:
+            continue
+        kind = "dir" if child.is_dir() else "file"
+        entries.append(f"{kind}\t{rel(child)}")
+    return "\n".join(entries) if entries else "(empty)"
+
+
+def read_file(path: str, start_line: int = 1, end_line: int | None = None) -> str:
+    target = resolve_path(path)
+    reason = blocked(target)
+    if reason:
+        return reason
+    if not target.is_file():
+        return f"Not a file: {path}"
+    start = max(1, int(start_line or 1))
+    end = int(end_line) if end_line else start + 399
+    if end < start:
+        return "end_line must be >= start_line"
+    text = target.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    selected = lines[start - 1 : end]
+    numbered = [f"{i}|{line}" for i, line in enumerate(selected, start=start)]
+    header = f"{rel(target)} lines {start}-{min(end, len(lines))} of {len(lines)}"
+    body = "\n".join(numbered) if numbered else "(no lines in range)"
+    return header + "\n" + body
+
+
+def search(pattern: str, path: str = ".", regex: bool = False) -> str:
+    import re
+
+    root = resolve_path(path or ".")
+    if not root.exists():
+        return f"Not found: {path}"
+    flags = 0
+    try:
+        compiled = re.compile(pattern if regex else re.escape(pattern), flags)
+    except re.error as exc:
+        return f"Invalid pattern: {exc}"
+    files = [root] if root.is_file() else [p for p in root.rglob("*") if p.is_file()]
+    hits: list[str] = []
+    for file in files:
+        if blocked(file) or any(part in BLOCKED_NAMES for part in file.parts):
+            continue
+        if file.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".zip", ".exe", ".dll"}:
+            continue
+        try:
+            text = file.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for i, line in enumerate(text.splitlines(), start=1):
+            if compiled.search(line):
+                hits.append(f"{rel(file)}:{i}:{line[:240]}")
+                if len(hits) >= 80:
+                    return "\n".join(hits) + "\n(truncated)"
+    return "\n".join(hits) if hits else "No matches."
+
+
+def write_file(path: str, content: str) -> str:
+    target = resolve_path(path)
+    reason = blocked(target)
+    if reason:
+        return reason
+    if len(content) > 1_000_000:
+        return "Refused: content exceeds 1,000,000 characters."
+    target.parent.mkdir(parents=True, exist_ok=True)
+    existed = target.exists()
+    target.write_text(content, encoding="utf-8", newline="\n")
+    action = "Overwrote" if existed else "Created"
+    return f"{action} {rel(target)} ({len(content)} chars)"
+
+
+def edit_file(path: str, old_str: str, new_str: str) -> str:
+    target = resolve_path(path)
+    reason = blocked(target)
+    if reason:
+        return reason
+    if not target.is_file():
+        return f"Not a file: {path}"
+    if old_str == "":
+        return "old_str must not be empty."
+    text = target.read_text(encoding="utf-8")
+    count = text.count(old_str)
+    if count == 0:
+        return "old_str was not found. Read the file and copy the exact text."
+    if count > 1:
+        return f"old_str matched {count} times. Include more surrounding context so it is unique."
+    updated = text.replace(old_str, new_str, 1)
+    target.write_text(updated, encoding="utf-8", newline="\n")
+    return f"Edited {rel(target)}"
+
+
+def run_action(step: Action) -> str:
+    try:
+        if step.action == "list_dir":
+            return list_dir(step.path or ".")
+        if step.action == "read_file":
+            end = step.end_line if step.end_line else None
+            return read_file(step.path, step.start_line or 1, end)
+        if step.action == "search":
+            return search(step.pattern, step.path or ".", step.regex)
+        if step.action == "write_file":
+            return write_file(step.path, step.content)
+        if step.action == "edit_file":
+            return edit_file(step.path, step.old_str, step.new_str)
+        if step.action == "use_skill":
+            skill = find_skill(step.skill or step.path)
+            if skill is None:
+                known = ", ".join(item.name for item in discover_skills()) or "(none)"
+                return f"No skill named {step.skill or step.path}. Known skills: {known}"
+            return f"Follow this skill ({skill.rel_path}):\n{skill.text}"
+        if step.action == "done":
+            return step.reply or "Done."
+        return f"Unknown action: {step.action}"
+    except TypeError as exc:
+        return f"Invalid arguments for {step.action}: {exc}"
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
+def lexer_for(path: str) -> str:
+    return LEXERS.get(Path(path).suffix.lower(), "text")
+
+
+def syntax_block(code: str, path: str, start_line: int = 1) -> Syntax:
+    return Syntax(
+        code,
+        lexer_for(path),
+        theme="monokai",
+        line_numbers=True,
+        start_line=start_line,
+        background_color="default",
+        word_wrap=True,
+    )
+
+
+def show_banner(model: str, effort: str) -> None:
+    console.print(
+        f"[dim]model[/dim] [bold]{model}[/bold]  [dim]reasoning[/dim] [bold cyan]{effort}[/bold cyan]  [dim]context[/dim] [bold]{MAX_CONTEXT_TOKENS}[/bold]  [dim]workspace[/dim] {WORKSPACE}"
+    )
+
+
+def show_skill(name: str) -> None:
+    console.print(f"[bold green]skill[/bold green] {name}")
+
+
+def show_thinking() -> None:
+    console.print("[bold cyan]Thinking...[/bold cyan]")
+
+
+def show_thought(thought: str) -> None:
+    console.print(Panel(Text(thought), title="thought", title_align="left", border_style="cyan", padding=(0, 1)))
+
+
+def show_tool(action: str, target: str) -> None:
+    label = Text(action, style="bold magenta")
+    if target:
+        label.append(" ")
+        label.append(target, style="white")
+    console.print(label)
+
+
+def show_code(path: str, code: str, start_line: int = 1) -> None:
+    lines = code.splitlines()
+    shown = "\n".join(lines[:80])
+    if shown:
+        console.print(syntax_block(shown, path, start_line))
+    if len(lines) > 80:
+        console.print(f"[dim]… {len(lines) - 80} more lines[/dim]")
+
+
+def show_tool_result(action: str, target: str, result: str) -> None:
+    if not result:
+        return
+    if action == "list_dir":
+        for line in result.splitlines():
+            kind, _, name = line.partition("\t")
+            if kind == "dir":
+                console.print(f"[bold cyan]{name}/[/bold cyan]")
+            elif kind == "file":
+                console.print(name)
+            else:
+                console.print(line, style="dim")
+        return
+    if action == "read_file" and " lines " in result.splitlines()[0]:
+        header, _, body = result.partition("\n")
+        console.print(f"[dim]{header}[/dim]")
+        if not body or body.startswith("(no lines"):
+            console.print(body, style="dim")
+            return
+        code_lines = []
+        start = 1
+        for index, line in enumerate(body.splitlines()):
+            number, sep, code = line.partition("|")
+            if sep and number.isdigit():
+                if index == 0:
+                    start = int(number)
+                code_lines.append(code)
+            else:
+                code_lines.append(line)
+        show_code(header.split(" ", 1)[0], "\n".join(code_lines), start)
+        return
+    if action == "search":
+        lines = result.splitlines()
+        for line in lines[:40]:
+            path, sep, rest = line.partition(":")
+            if sep and rest[:1].isdigit():
+                number, _, code = rest.partition(":")
+                console.print(f"[cyan]{path}[/cyan]:[yellow]{number}[/yellow]: {code}")
+            else:
+                console.print(line, style="dim")
+        if len(lines) > 40:
+            console.print(f"[dim]… {len(lines) - 40} more matches[/dim]")
+        return
+    if result.startswith(("Created ", "Overwrote ", "Edited ")):
+        console.print(f"[bold green]{result}[/bold green]")
+        return
+    if result.startswith(("Refused", "Not ", "No ", "old_str", "Invalid", "Error", "Unknown")):
+        preview = result if len(result) < 800 else result[:800] + "…"
+        console.print(preview, style="red")
+        return
+    preview = result if len(result) < 800 else result[:800] + "…"
+    console.print(preview, style="dim")
+
+
+def show_reply(text: str) -> None:
+    if not text:
+        return
+    console.print(Panel(Markdown(text), title="response", title_align="left", border_style="green", padding=(0, 1)))
+
+
+class Agent:
+    def __init__(self, model: str, effort: str, show_reasoning: bool = False):
+        self.client = create_client()
+        self.model = model
+        self.effort = effort
+        self.show_reasoning = show_reasoning
+        self.messages: list[dict] = [{"role": "system", "content": build_system_prompt()}]
+
+    def complete(self, messages: list[dict]):
+        return self.client.beta.chat.completions.parse(
+            model=self.model,
+            messages=messages,
+            response_format=Action,
+            reasoning_effort=self.effort,
+            max_completion_tokens=MAX_COMPLETION_TOKENS,
+        )
+
+    def ask(self, user_text: str) -> str:
+        self.messages[0] = {"role": "system", "content": build_system_prompt()}
+        expanded = expand_slash(user_text)
+        claude = WORKSPACE / "CLAUDE.md"
+        claude_text = claude.read_text(encoding="utf-8") if claude.is_file() else ""
+        skills = skills_for_texts([user_text, expanded, claude_text])
+        for skill in skills:
+            show_skill(skill.name)
+        if skills:
+            expanded += "\n\n" + render_skills(skills)
+        self.messages.append({"role": "user", "content": expanded})
+        while True:
+            show_thinking()
+            response = self.complete(self.messages)
+            message = response.choices[0].message
+            if message.refusal:
+                return message.refusal
+            step = message.parsed
+            if step is None:
+                return message.content or "Model returned no action."
+            thought = (step.thought or "").strip()
+            if thought:
+                show_thought(thought)
+            self.messages.append({"role": "assistant", "content": step.model_dump_json()})
+            if step.action == "done":
+                return step.reply or "Done."
+            target = step.skill if step.action == "use_skill" else step.path
+            show_tool(step.action, target)
+            result = run_action(step)
+            show_tool_result(step.action, target, result)
+            if step.action == "write_file" and result.startswith(("Created ", "Overwrote ")):
+                show_code(step.path, step.content)
+            elif step.action == "edit_file" and result.startswith("Edited "):
+                console.print("[red]- old[/red]")
+                show_code(step.path, step.old_str)
+                console.print("[green]+ new[/green]")
+                show_code(step.path, step.new_str)
+            self.messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "TOOL_RESULT:\n"
+                        + result
+                        + "\nContinue with the next action, or action=done and a short reply."
+                    ),
+                }
+            )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Nexus high-effort file agent")
+    parser.add_argument("prompt", nargs="+", help="One-shot prompt. Exits when the reply is done.")
+    parser.add_argument("--model", default=MODEL)
+    parser.add_argument("--effort", default=REASONING_EFFORT, choices=["none", "low", "medium", "high", "xhigh"])
+    parser.add_argument("--show-reasoning", action="store_true")
+    args = parser.parse_args()
+
+    show_banner(args.model, args.effort)
+    agent = Agent(args.model, args.effort, args.show_reasoning)
+    try:
+        show_reply(agent.ask(" ".join(args.prompt)))
+    except Exception as exc:
+        err_console.print(f"[red]Error:[/red] {exc}")
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
+
+<!-- ==== FILE: hello.py ==== -->
+#!/usr/bin/env python3
+"""Render command-line text as large 3D ASCII art with a shadow."""
+
+from __future__ import annotations
+
+import argparse
+
+
+# Each glyph is five columns wide and seven rows tall.
+FONT = {
+    "A": ("01110", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "B": ("11110", "10001", "10001", "11110", "10001", "10001", "11110"),
+    "C": ("01111", "10000", "10000", "10000", "10000", "10000", "01111"),
+    "D": ("11110", "10001", "10001", "10001", "10001", "10001", "11110"),
+    "E": ("11111", "10000", "10000", "11110", "10000", "10000", "11111"),
+    "F": ("11111", "10000", "10000", "11110", "10000", "10000", "10000"),
+    "G": ("01111", "10000", "10000", "10111", "10001", "10001", "01111"),
+    "H": ("10001", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "I": ("11111", "00100", "00100", "00100", "00100", "00100", "11111"),
+    "J": ("00111", "00010", "00010", "00010", "10010", "10010", "01100"),
+    "K": ("10001", "10010", "10100", "11000", "10100", "10010", "10001"),
+    "L": ("10000", "10000", "10000", "10000", "10000", "10000", "11111"),
+    "M": ("10001", "11011", "10101", "10101", "10001", "10001", "10001"),
+    "N": ("10001", "11001", "10101", "10011", "10001", "10001", "10001"),
+    "O": ("01110", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "P": ("11110", "10001", "10001", "11110", "10000", "10000", "10000"),
+    "Q": ("01110", "10001", "10001", "10001", "10101", "10010", "01101"),
+    "R": ("11110", "10001", "10001", "11110", "10100", "10010", "10001"),
+    "S": ("01111", "10000", "10000", "01110", "00001", "00001", "11110"),
+    "T": ("11111", "00100", "00100", "00100", "00100", "00100", "00100"),
+    "U": ("10001", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "V": ("10001", "10001", "10001", "10001", "10001", "01010", "00100"),
+    "W": ("10001", "10001", "10001", "10101", "10101", "10101", "01010"),
+    "X": ("10001", "10001", "01010", "00100", "01010", "10001", "10001"),
+    "Y": ("10001", "10001", "01010", "00100", "00100", "00100", "00100"),
+    "Z": ("11111", "00001", "00010", "00100", "01000", "10000", "11111"),
+    "0": ("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
+    "1": ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
+    "2": ("01110", "10001", "00001", "00010", "00100", "01000", "11111"),
+    "3": ("11110", "00001", "00001", "01110", "00001", "00001", "11110"),
+    "4": ("00010", "00110", "01010", "10010", "11111", "00010", "00010"),
+    "5": ("11111", "10000", "10000", "11110", "00001", "00001", "11110"),
+    "6": ("01110", "10000", "10000", "11110", "10001", "10001", "01110"),
+    "7": ("11111", "00001", "00010", "00100", "01000", "01000", "01000"),
+    "8": ("01110", "10001", "10001", "01110", "10001", "10001", "01110"),
+    "9": ("01110", "10001", "10001", "01111", "00001", "00001", "01110"),
+    "!": ("00100", "00100", "00100", "00100", "00100", "00000", "00100"),
+    "?": ("01110", "10001", "00001", "00010", "00100", "00000", "00100"),
+    ".": ("00000", "00000", "00000", "00000", "00000", "00000", "00100"),
+    ",": ("00000", "00000", "00000", "00000", "00000", "00100", "01000"),
+    ":": ("00000", "00100", "00100", "00000", "00100", "00100", "00000"),
+    "-": ("00000", "00000", "00000", "11111", "00000", "00000", "00000"),
+    "_": ("00000", "00000", "00000", "00000", "00000", "00000", "11111"),
+    "+": ("00000", "00100", "00100", "11111", "00100", "00100", "00000"),
+    "/": ("00001", "00010", "00010", "00100", "01000", "01000", "10000"),
+    "'": ("00100", "00100", "00000", "00000", "00000", "00000", "00000"),
+    " ": ("000", "000", "000", "000", "000", "000", "000"),
+}
+
+
+def render_3d(
+    text: str,
+    face: str = "#",
+    shadow: str = ".",
+    depth: int = 2,
+    scale: int = 2,
+) -> str:
+    """Return *text* as bold bitmap letters with a down-right 3D shadow."""
+    glyphs = [FONT.get(character, FONT["?"]) for character in text.upper()]
+    face_pixels: set[tuple[int, int]] = set()
+    cursor = 0
+
+    for glyph in glyphs:
+        for y, row in enumerate(glyph):
+            for x, pixel in enumerate(row):
+                if pixel == "1":
+                    # Expanding in both directions gives the letters a bold weight.
+                    for scaled_y in range(scale):
+                        for scaled_x in range(scale):
+                            face_pixels.add(
+                                (
+                                    (cursor + x) * scale + scaled_x,
+                                    y * scale + scaled_y,
+                                )
+                            )
+        cursor += len(glyph[0]) + 1
+
+    if not face_pixels:
+        return ""
+
+    width = (cursor - 1) * scale + depth
+    height = 7 * scale + depth
+    canvas = [[" " for _ in range(width)] for _ in range(height)]
+
+    # Draw every offset layer, from back to front, to make a solid extrusion.
+    for offset in range(depth, 0, -1):
+        for x, y in face_pixels:
+            canvas[y + offset][x + offset] = shadow
+
+    for x, y in face_pixels:
+        canvas[y][x] = face
+
+    return "\n".join("".join(row).rstrip() for row in canvas).rstrip()
+
+
+def single_character(value: str) -> str:
+    """Validate argparse options which must contain one character."""
+    if len(value) != 1 or value.isspace():
+        raise argparse.ArgumentTypeError("must be exactly one non-space character")
+    return value
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Print text as large 3D ASCII letters with a shadow."
+    )
+    parser.add_argument(
+        "text",
+        nargs="+",
+        help='text to render (for example: "Hello world")',
+    )
+    parser.add_argument(
+        "-d", "--depth", type=int, default=2, choices=range(1, 9), metavar="1-8",
+        help="shadow depth (default: 2)",
+    )
+    parser.add_argument(
+        "-f", "--face", type=single_character, default="#", metavar="CHAR",
+        help="character used for letter faces (default: #)",
+    )
+    parser.add_argument(
+        "-s", "--shadow", type=single_character, default=".", metavar="CHAR",
+        help="character used for the 3D shadow (default: .)",
+    )
+    parser.add_argument(
+        "--scale", type=int, default=2, choices=range(1, 5), metavar="1-4",
+        help="bold font scale (default: 2)",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    print(
+        render_3d(
+            " ".join(args.text),
+            args.face,
+            args.shadow,
+            args.depth,
+            args.scale,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+<!-- ==== FILE: modelgard ==== -->
+Text Generation
+OpenAI Banner
+
+OpenAI's GPT (Generative Pre-trained Transformer) models are powerful generative AI systems capable of understanding and generating human-like text, images and audios.
+
+Relevant documentation:
+
+Terms of Use 📄
+Information about models not approved for production
+Want to know how many tokens you consume? Check the Nexus Consumer Dashboard
+Getting Started¶
+To get access, refer to How to get access to the models
+Find the endpoint here: Staging
+Available APIs¶
+ChatCompletions API
+
+We support the ChatCompletions API
+
+Responses API
+
+The Responses API is currently not supported, but is actively being worked on and will be available soon. It introduces several powerful built-in capabilities, including:
+
+Web Search — allows the model to search the internet for up-to-date information
+File Search — enables retrieval from uploaded files and vector stores
+Codex CLI — enables a terminal-based coding agent that can read, modify, and execute code autonomously
+API Version¶
+Since we use Microsoft Foundry as the provider, the service requires an API version.
+
+Unless specified, always use 2024-10-21(the latest stable version).
+
+From some use cases, and examples this may differ and might use the latest preview version 2025-04-01-preview. We will highlight this in the example.
+
+Available Models¶
+Model	Production
+gpt-6-astra	❌
+gpt-5.6-luna	✅
+gpt-5.6-terra	✅
+gpt-5.6-sol	✅
+gpt-5.5	✅
+gpt-5.4-mini	✅
+gpt-5.4-nano	❌
+gpt-5.4	❌
+gpt-5.2	❌
+gpt-5.1	✅
+gpt-5	✅
+gpt-5-mini	✅
+gpt-5-nano	✅
+gpt-4.1	❌
+gpt-4o	✅
+gpt-4o-mini	✅
+Migration from GPT-4o / GPT-4o-mini¶
+OpenAI has announced plans to retire gpt-4o and gpt-4o-mini. The deadline for this retirement is 31 August 2026. We will gradually migrate our resources to the successor models as use cases and consumption shift, so you should enjoy improved performance over time. You will be notified directly about any future migration alternatives. We recommend starting to plan your migration early to avoid disruption.
+
+Recommended successor: gpt-5.1 — it replaces both gpt-4o and gpt-4o-mini. Adjust reasoning_effort based on your task requirements.
+
+Why is GPT-5.1 slower by default?¶
+gpt-5, gpt-5.1, and gpt-5.2 are reasoning models — before producing a final answer, they perform an internal chain-of-thought to break down the problem, evaluate options, and verify their output. This extra "thinking" step improves accuracy and reliability, especially on complex tasks, but comes at the cost of higher latency and token usage.
+
+The tradeoff is straightforward: lowering reasoning effort reduces latency and token cost, but also reduces the model's accuracy on complex tasks. For simple tasks (classification, extraction, chat) this has little to no impact. For multi-step reasoning or analysis, you may notice a drop in quality.
+
+Tune reasoning_effort to match your task (see Reasoning):
+
+Task Complexity	reasoning_effort	Behavior
+Complex analysis, multi-step reasoning	high	Full reasoning — highest accuracy, highest latency
+General-purpose tasks	medium (default)	Balanced reasoning
+Simple chat, extraction, classification	low / minimal	Reduced reasoning — faster, slightly less depth
+Latency-critical (autocomplete, routing)	none	No reasoning — behaves like a traditional model, fastest response times
+Tip
+
+With reasoning_effort set to none, gpt-5.1 is often faster than gpt-5-nano while being more capable. This makes it a strong single-model choice across a wide range of use cases.
+
+Usage¶
+Initialize Client¶
+We recommend consuming the API with the official AzureOpenAI SDK. Otherwise, if you want to use another library or raw http requests, ignore this section.
+
+Install the SDK using pip
+
+
+pip install openai
+Setup the client:
+
+
+import os
+import openai
+
+client = openai.AzureOpenAI(
+    api_version="2024-10-21",
+    azure_endpoint="https://genai-nexus.api.corpinter.net/",
+    api_key=os.getenv("NEXUS_API_KEY"),  # set your API key
+)
+Text Input & Output¶
+For more information, refer to here.
+
+
+python
+curl
+
+completion = client.chat.completions.create(
+    model="<model-id>",
+    messages=[
+        {
+            "role": "user",
+            "content": "Say hello world!",
+        },
+    ],
+)
+print("Response: " + completion.choices[0].message.content)
+You can also stream the response for lower perceived latency, and time to first token.
+
+
+python
+curl
+Streaming Responses
+
+completion = client.chat.completions.create(
+        model="<model-id>",
+        messages=[
+            {
+                "role": "user",
+                "content": "Tell me a story!",
+            },
+        ],
+        stream=True,
+    )
+
+for chunk in completion:
+    if len(chunk.choices) > 0 and chunk.choices[0].delta:
+        choice = chunk.choices[0]
+        if choice.delta.content:
+            print(chunk.choices[0].delta.content, end="", flush=True)
+Image Input¶
+You can send images by either sending the image as a base64 string or by providing a URL to the image. Further, you can send multiple images in a single request.
+
+Pass the Images either as URL
+
+
+python
+curl
+
+response = client.chat.completions.create(
+    model="<model-id>",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What's in this image?"},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg",
+                },
+            },
+        ],
+        }],
+)
+or encoded as base64
+
+
+... # inside the content field
+{
+    "type": "image_url",
+    "image_url": {
+      "url": "data:image/jpeg;base64,<base64-encoded-image>"
+    }
+}
+...
+Read the documentation for more configurations.
+
+Structured Outputs¶
+You can extract structured information following the guide Structured Outputs
+
+
+python
+curl
+Note
+
+Be careful to use the "beta" client of AzureOpenAI. client.beta.chat.completions.parse(...)
+
+
+class CalendarEvent(BaseModel):
+    name: str
+    date: str
+    participants: list[str]
+
+completion = client.beta.chat.completions.parse(
+    model="<model-id>", # replace with the
+    messages=[
+        {"role": "system", "content": "Extract the event information."},
+        {"role": "user", "content": "Alice and Bob are going to a science fair on Friday."},
+    ],
+    response_format=CalendarEvent,
+)
+
+event = completion.choices[0].message.parsed
+
+print(event)
+print(completion.model_dump_json(indent=2))
+Reasoning¶
+Constrains effort on reasoning for reasoning models. Currently supported values are minimal (only gpt-5 and newer), low, medium, and high.
+
+For gpt-5.1 and newer models you can disable thinking via none to minimize latency.
+
+Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning in a response.
+
+Refer to the official OpenAI - Reasoning Models for more information.
+
+
+python
+curl
+
+response = client.chat.completions.create(
+    model="gpt-5",
+    reasoning_effort="medium",
+    messages=[
+        {
+            "role": "user",
+            "content": "What is the meaning of life?"
+        }
+    ]
+)
+print(response.choices[0].message.content)
+Function Calling / Tool Use¶
+Function calling (also known as tool calling) provides a powerful and flexible way for OpenAI models to interface with external systems and access data outside their training data. This guide shows how you can connect a model to data and actions provided by your application. [OpenAI Function Calling Guide]
+
+Function Calling Flow
+
+First let's define a helper function that help us validate tool invocations to prevent hallucination:
+
+
+import inspect
+
+
+def check_args(function, args):
+    sig = inspect.signature(function)
+    params = sig.parameters
+
+    # Check if there are extra arguments
+    for name in args:
+        if name not in params:
+            return False
+    # Check if the required arguments are provided
+    for name, param in params.items():
+        if param.default is param.empty and name not in args:
+            return False
+
+    return True
+This is our mock tool call.
+
+
+def get_current_weather(location, date: str, unit: str = 'celcius'):
+    # Make API call to backend/service. Hard-coded here to illustrate the concept and mock the response.
+    # return requests.post("/...", json={"location": location, "date": date, "unit": unit})
+    return {
+        "location": "Stuttgart",
+        "temperature": 22.3,
+        "precipitation": "0%",
+        "unit": unit
+    }
+The following flow shoes how to use function calling with OpenAI Chat Completions in a non-streaming fashion:
+
+
+messages = [
+    {
+        "role": "user",
+        "content": "What is the weather like tomorrow in Stuttgart?"
+    }
+]
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_weather",
+            "description": """
+                Get the current weather in a given location.
+
+                Note: any US cities have temperatures in Fahrenheit
+            """,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city and state, e.g. San Francisco, CA",
+                    },
+                    "date": {
+                        "type": "date",
+                        "description": "The date to get the weather forecast for, in YYYY-MM-DD format.",
+                    },
+                    "unit": {
+                        "type": "string",
+                        "description": "The temperature unit (Defaults to 'celcius'). Available types: 'celcius', 'fahrenheit'",
+                    }
+                },
+                "required": ["location", "date"],
+            },
+        },
+    }
+]
+response = client.chat.completions.create(
+    model="<model-id>",
+    messages=messages,
+    tools=tools,
+    tool_choice="auto",  # auto is default, but we'll be explicit
+)
+
+response_message = response.choices[0].message
+tool_calls = response_message.tool_calls
+
+# check if the model wanted to make a tool call
+if tool_calls:
+
+    # extend message with model's response
+    messages.append(response_message)
+
+    for tool_call in tool_calls:
+        fn_name = tool_call.function.name
+        args = tool_call.function.arguments
+        fn = {
+            "get_current_weather": get_current_weather,
+        }.get(fn_name)
+
+        # 1. Validation
+        if fn is None:
+            raise ValueError(f"Function {fn_name} invoked by model is not a valid function")
+        if not check_args(fn, args):
+            raise ValueError(f"Function {fn_name} invoked by model has invalid arguments: {args}")
+
+        # 2. Call the tool
+        function_response = fn(**args)
+
+        # 3. Extend the messages with function response
+        messages.append(
+            {
+                "tool_call_id": tool_call.id,
+                "role": "tool",
+                "name": fn_name,
+                "content": function_response,
+            }
+        )
+
+    # 4. Get final response from model
+    final_response = client.chat.completions.create(
+        model="<model-id>",
+        messages=messages,
+    )
+If you are streaming the response, the flow is similar, but you need to handle tool calls as they come in the stream.
+
+
+def process_response_stream_with_tool_calls(stream):
+    tool_calls = []
+    delta = None
+
+    for chunk in stream:
+        delta = chunk.choices[0].delta if chunk.choices and chunk.choices[0].delta is not None else None
+
+        if delta and delta.content:
+            print(delta.content, end="", flush=True)
+
+        elif delta and delta.tool_calls:
+            tc_chunk_list = delta.tool_calls
+            for tc_chunk in tc_chunk_list:
+                if len(tool_calls) <= tc_chunk.index:
+                    tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                tc = tool_calls[tc_chunk.index]
+
+                if tc_chunk.id:
+                    tc["id"] += tc_chunk.id
+                if tc_chunk.function.name:
+                    tc["function"]["name"] += tc_chunk.function.name
+                if tc_chunk.function.arguments:
+                    tc["function"]["arguments"] += tc_chunk.function.arguments
+
+
+stream = client.chat.completions.create(
+    model="<model-id>",
+    messages=messages,
+    tools=tools,
+    tool_choice="auto",  # auto is default, but we'll be explicit
+    stream=True
+)
+
+process_response_stream_with_tool_calls(stream)
+Resources¶
+OpenAI Chat Completions API Reference¶
+OpenAI Model Details¶
+(not necessarily all models are provided by the AI-Nexus)
+<!-- ==== FILE: requirements.txt ==== -->
+openai>=1.50.0
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+rich>=13.0.0
+pygments>=2.0.0
+
+<!-- ==== FILE: __PACK_META__ ==== -->
+files:      6
+chars:      45869
+packed_at:  2026-sep-22 19:14:35
